@@ -118,6 +118,10 @@ check("预览 200 且含统计",
       r.status_code == 200 and "affected" in prev and "changes" in prev,
       str(r.status_code))
 check("预览统计 pending_total > 0", prev["pending_total"] > 0, str(prev["pending_total"]))
+# 三锚点覆盖旧1..旧10，所有待确认定位号都在区间内，区间外保留为 0
+check("预览含 scoped_total/preserved 字段",
+      "scoped_total" in prev and "preserved" in prev)
+check("首锚为旧1时区间外保留 0", prev["preserved"] == 0, str(prev["preserved"]))
 
 # 预览不改变正式候选
 state2 = jget(f"/api/state/{pid}").get_json()
@@ -164,6 +168,47 @@ check("导出锚点 5 个（3 启用 2 停用）", len(data["anchors"]) == 5, st
 check("导出含备注", any(a["note"] for a in data["anchors"]))
 check("导出含停用锚点冲突", any(c["kind"] == "disabled_anchor" for c in data["conflicts"]))
 
+# 内部锚点场景：把上面的锚点全部停用，改用 旧3→新4、旧7→新9，
+# 验证区间外候选原样保留、preserved 计数正确。
+conn2 = dbmod.get_db()
+conn2.execute("UPDATE page_anchors SET status='disabled' WHERE project_id=?", (pid,))
+conn2.commit()
+# 先把 Lifespan（前面被改绑确认）重置为待确认，恢复候选
+jpost(f"/api/locators/{lid}/decision", {"action": "reset"})
+jpost(f"/api/projects/{pid}/match")
+
+
+def cid_of(term):
+    return conn2.execute(
+        """SELECT c.id FROM candidates c JOIN locators l ON l.id=c.locator_id
+           JOIN entries e ON e.id=l.entry_id
+           WHERE e.project_id=? AND e.term=? AND c.rank=1""",
+        (pid, term)).fetchone()["id"]
+
+
+cid_hb_before, cid_ws_before = cid_of("Honey Bees"), cid_of("Winter stores")
+
+jpost(f"/api/projects/{pid}/anchors", {"old_page": 3, "new_page": 4, "note": "区间界定一"})
+jpost(f"/api/projects/{pid}/anchors", {"old_page": 7, "new_page": 9, "note": "区间界定二"})
+r = jpost(f"/api/projects/{pid}/rematch/preview")
+pv = r.get_json()
+check("内部锚点预览：区间外保留数 >= 3（旧1/旧2/旧9-10）",
+      pv["preserved"] >= 3, str(pv["preserved"]))
+check("内部锚点预览：区间内参与数 > 0", pv["scoped_total"] > 0, str(pv["scoped_total"]))
+check("内部锚点预览：scoped + preserved = 全部待确认",
+      pv["scoped_total"] + pv["preserved"] == pv["pending_total"],
+      f"{pv['scoped_total']}+{pv['preserved']} vs {pv['pending_total']}")
+# 预览不动正式数据
+check("预览后区间外候选行 id 不变（未重建）",
+      cid_of("Honey Bees") == cid_hb_before
+      and cid_of("Winter stores") == cid_ws_before)
+
+# 执行重匹配后，区间外候选行 id 仍然不变
+jpost(f"/api/projects/{pid}/rematch")
+check("重匹配后区间外 Honey Bees 候选原样保留", cid_of("Honey Bees") == cid_hb_before)
+check("重匹配后区间外 Winter stores 候选原样保留",
+      cid_of("Winter stores") == cid_ws_before)
+
 # 快照：保存含锚点 -> 删除锚点 -> 恢复 -> 锚点回来
 r = jpost(f"/api/projects/{pid}/snapshots", {"name": "含锚点版本"})
 sid = r.get_json()["id"]
@@ -175,7 +220,7 @@ check("删除后无锚点", len(st_after_del["anchors"]) == 0)
 r = jpost(f"/api/projects/{pid}/snapshots/{sid}/restore")
 check("快照恢复 200", r.status_code == 200, str(r.status_code))
 st_rest = jget(f"/api/projects/{pid}/anchors").get_json()
-check("恢复后 5 个锚点回来", len(st_rest["anchors"]) == 5, str(len(st_rest["anchors"])))
+check("恢复后 7 个锚点回来", len(st_rest["anchors"]) == 7, str(len(st_rest["anchors"])))
 check("恢复保留停用状态",
       any(a["status"] == "disabled" for a in st_rest["anchors"]))
 

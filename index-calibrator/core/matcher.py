@@ -161,11 +161,13 @@ def _crosses_chapter(new_start, new_end, chapter_starts):
 # ---- 主入口 -------------------------------------------------------------
 
 def run_matching(conn, project_id, only_locator_ids=None, chapter_starts_new=None,
-                 threshold=0.85, anchor_ctx=None):
+                 threshold=0.85, anchor_ctx=None, anchor_scope=False):
     """重算候选页。
 
     anchor_ctx 为 :func:`core.anchors.build_ctx` 的结果；传入 False 可显式
     关闭锚点约束，None 时按数据库当前启用锚点自动构建。
+    anchor_scope=True 时（按锚点重匹配），只重算旧范围与「首锚～末锚」区间
+    相交的待确认定位号；区间外的待确认定位号候选原样保留，不删除也不重建。
     """
     if anchor_ctx is None:
         anchor_ctx = build_ctx(conn, project_id)
@@ -189,6 +191,13 @@ def run_matching(conn, project_id, only_locator_ids=None, chapter_starts_new=Non
     q = ("SELECT l.*, e.term, e.subterm FROM locators l JOIN entries e ON e.id=l.entry_id "
          "WHERE e.project_id=? AND l.status='pending'")
     args = [project_id]
+    if anchor_scope and anchor_ctx:
+        # 按锚点重匹配：仅旧范围与首末锚点所夹旧页区间相交的待确认定位号参与；
+        # 区间外（首锚之前、末锚之后）的候选一律保留，不删除、不重建。
+        first_old = anchor_ctx["anchors"][0]["old_page"]
+        last_old = anchor_ctx["anchors"][-1]["old_page"]
+        q += " AND COALESCE(l.old_end, l.old_start) >= ? AND l.old_start <= ?"
+        args += [first_old, last_old]
     if only_locator_ids:
         q += " AND l.id IN (%s)" % ",".join("?" * len(only_locator_ids))
         args += list(only_locator_ids)

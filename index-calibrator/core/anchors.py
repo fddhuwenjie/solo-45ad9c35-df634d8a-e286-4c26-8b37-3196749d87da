@@ -3,8 +3,9 @@
 
 启用的锚点按旧版页排序后必须形成**单调分段映射**：旧页严格递增、新页也严格
 递增（不允许倒退、重复占用）。相邻锚点之间是一个分段区间，区间内旧页按线性
-插值投影到新页；首锚之前 / 末锚之后沿用最近区间的斜率外推（无锚或仅有一锚
-时回退为斜率 1）。
+插值投影到新页（斜率小于 1 时允许多页折叠到同一新页，投影非递减即可）；
+首锚之前 / 末锚之后沿用最近区间的斜率外推（无锚或仅有一锚时回退为斜率 1）。
+**锚点页本身始终精确映射到人工指定的新页**，任何夹取/折叠都不得移动锚点。
 
 本模块提供：
   * validate_anchor      —— 新建/启用单个锚点时的规则校验（倒退/重复/越界）；
@@ -98,35 +99,74 @@ def build_ctx(conn, project_id):
     for a, b in zip(act, act[1:]):
         slopes[a["old_page"]] = _slope(a, b)
 
-    def project(op):
-        """旧页 op 投影到新页（线性插值/外推，四舍五入，保持单调）。"""
+    anchor_old = {a["old_page"]: a["new_page"] for a in act}
+
+    def raw_project(op):
+        """锚点页精确映射；其余页线性插值/外推（未取整、未 clamp）。"""
+        if op in anchor_old:
+            return float(anchor_old[op])
         if len(act) == 1:
-            val = act[0]["new_page"] + (op - act[0]["old_page"])
-        elif op <= act[0]["old_page"]:
+            a = act[0]
+            return a["new_page"] + (op - a["old_page"])
+        if op < act[0]["old_page"]:
             a, b = act[0], act[1]
-            val = a["new_page"] + (op - a["old_page"]) * _slope(a, b)
-        elif op >= act[-1]["old_page"]:
+            return a["new_page"] + (op - a["old_page"]) * _slope(a, b)
+        if op > act[-1]["old_page"]:
             a, b = act[-2], act[-1]
-            val = b["new_page"] + (op - b["old_page"]) * _slope(a, b)
-        else:
-            for a, b in zip(act, act[1:]):
-                if a["old_page"] <= op <= b["old_page"]:
-                    val = a["new_page"] + (op - a["old_page"]) * _slope(a, b)
-                    break
-        return _round_half_away(val)
+            return b["new_page"] + (op - b["old_page"]) * _slope(a, b)
+        for a, b in zip(act, act[1:]):
+            if a["old_page"] < op < b["old_page"]:
+                return a["new_page"] + (op - a["old_page"]) * _slope(a, b)
+        return float(anchor_old.get(op, op))
 
-    # 逐页投影表（仅旧版实有页）
+    def project(op):
+        """对外投影：与逐页表一致（锚点页精确，非锚页四舍五入）。"""
+        if op in anchor_old:
+            return anchor_old[op]
+        return _round_half_away(raw_project(op))
+
+    # 逐页投影表（仅旧版实有页）。分段构造，关键不变量：
+    #   1) 锚点页必须精确落在其人工指定的新页（压缩区间同样保留，如 旧10→新5）；
+    #   2) 区间内允许非递减折叠（斜率 < 1 时多页可投影到同一新页），只做
+    #      [前一值, 段末锚点新页] 夹取，绝不用 +1 顶开锚点；
+    #   3) 首/尾外推段夹到全书新页范围。
     page_map = {}
-    prev = None
-    for op in range(olo, ohi + 1):
-        np_ = project(op)
-        # 数值上兜底保证严格单调（极端斜率/外推越界时不折叠）
-        if prev is not None and np_ <= prev:
-            np_ = prev + 1
-        page_map[op] = np_
-        prev = np_
 
-    # 反查：新页 -> 旧投影页（取最近投影，供新区间归属）
+    def fill_segment(pages, lo_bound, hi_bound):
+        prev = None
+        for op in pages:
+            if op in anchor_old:
+                np_ = anchor_old[op]            # 锚点页：精确值，不夹不取整
+            else:
+                np_ = _round_half_away(raw_project(op))
+                if lo_bound is not None and np_ < lo_bound:
+                    np_ = lo_bound
+                if hi_bound is not None and np_ > hi_bound:
+                    np_ = hi_bound
+                if prev is not None and np_ < prev:
+                    np_ = prev                   # 非递减（允许与前页相同）
+            page_map[op] = np_
+            prev = np_
+
+    if len(act) == 1:
+        a = act[0]
+        # 单锚：锚点精确，两侧斜率 1 外推，夹到全书新页范围
+        pages_before = [o for o in range(olo, a["old_page"])]
+        fill_segment(pages_before, nlo, a["new_page"])
+        fill_segment([a["old_page"]], None, None)
+        fill_segment([o for o in range(a["old_page"] + 1, ohi + 1)],
+                     a["new_page"], nhi)
+    else:
+        fill_segment([o for o in range(olo, act[0]["old_page"])],
+                     nlo, act[0]["new_page"])
+        fill_segment([act[0]["old_page"]], None, None)
+        for a, b in zip(act, act[1:]):
+            fill_segment([o for o in range(a["old_page"] + 1, b["old_page"])],
+                         a["new_page"], b["new_page"])
+            fill_segment([b["old_page"]], None, None)
+        fill_segment([o for o in range(act[-1]["old_page"] + 1, ohi + 1)],
+                     act[-1]["new_page"], nhi)
+
     return {
         "anchors": act,
         "slopes": slopes,

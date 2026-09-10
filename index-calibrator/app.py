@@ -405,25 +405,37 @@ def _snapshot_to_memory(conn):
     return mem
 
 
-def _rematch_changes(conn, pid):
-    """在内存副本上按锚点重算全部待确认定位号，返回新旧头名候选对照。"""
+def _rematch_changes(conn, pid, ctx):
+    """在内存副本上按锚点重算**锚点区间内**的待确认定位号，返回新旧头名候选对照。
+
+    区间外（首锚旧页之前、末锚旧页之后）的待确认定位号不参与重算，
+    其候选原样保留（preserved 计数，不出现在 changes 中）。
+    """
     ch_new = detect_chapter_starts(conn, pid, "new")
     threshold = conn.execute(
         "SELECT batch_threshold FROM projects WHERE id=?", (pid,)).fetchone()[0]
-    before = {r["id"]: dict(r) for r in conn.execute(
-        """SELECT c.locator_id AS id, c.new_start, c.new_end, c.method, c.score
-             FROM candidates c JOIN locators l ON l.id=c.locator_id
-             JOIN entries e ON e.id=l.entry_id
-            WHERE e.project_id=? AND c.rank=1 AND l.status='pending'""", (pid,))}
 
-    mem = _snapshot_to_memory(conn)
-    try:
-        run_matching(mem, pid, chapter_starts_new=ch_new, threshold=threshold)
-        after = {r["id"]: dict(r) for r in mem.execute(
+    first_old = ctx["anchors"][0]["old_page"]
+    last_old = ctx["anchors"][-1]["old_page"]
+    scope_where = (" AND COALESCE(l.old_end, l.old_start) >= ? "
+                   "AND l.old_start <= ?")
+    scope_args = [first_old, last_old]
+
+    def scoped_candidates(c):
+        return c.execute(
             """SELECT c.locator_id AS id, c.new_start, c.new_end, c.method, c.score
                  FROM candidates c JOIN locators l ON l.id=c.locator_id
                  JOIN entries e ON e.id=l.entry_id
-                WHERE e.project_id=? AND c.rank=1 AND l.status='pending'""", (pid,))}
+                WHERE e.project_id=? AND c.rank=1 AND l.status='pending'"""
+            + scope_where, [pid] + scope_args).fetchall()
+
+    before = {r["id"]: dict(r) for r in scoped_candidates(conn)}
+
+    mem = _snapshot_to_memory(conn)
+    try:
+        run_matching(mem, pid, chapter_starts_new=ch_new, threshold=threshold,
+                     anchor_ctx=ctx, anchor_scope=True)
+        after = {r["id"]: dict(r) for r in scoped_candidates(mem)}
     finally:
         mem.close()
 
@@ -431,7 +443,18 @@ def _rematch_changes(conn, pid):
               for r in conn.execute(
         """SELECT l.id, e.term, e.subterm, l.old_start, l.old_end
              FROM locators l JOIN entries e ON e.id=l.entry_id
-            WHERE e.project_id=? AND l.status='pending'""", (pid,))}
+            WHERE e.project_id=? AND l.status='pending'"""
+        + scope_where, [pid] + scope_args)}
+
+    # 区间外待确认定位号（候选原样保留，不参与重算）
+    preserved = conn.execute(
+        """SELECT COUNT(*) c FROM locators l JOIN entries e ON e.id=l.entry_id
+            WHERE e.project_id=? AND l.status='pending'
+              AND NOT (COALESCE(l.old_end, l.old_start) >= ? AND l.old_start <= ?)""",
+        [pid] + scope_args).fetchone()["c"]
+    pending_total = conn.execute(
+        "SELECT COUNT(*) c FROM locators l JOIN entries e ON e.id=l.entry_id "
+        "WHERE e.project_id=? AND l.status='pending'", (pid,)).fetchone()["c"]
 
     changes, added, dropped = [], [], []
     for lid in sorted(set(before) | set(after)):
@@ -453,7 +476,9 @@ def _rematch_changes(conn, pid):
             added.append({"locator_id": lid, "label": label,
                           "after": [a["new_start"], a["new_end"]]})
     return {
-        "pending_total": len(labels),
+        "pending_total": pending_total,
+        "scoped_total": len(labels),
+        "preserved": preserved,
         "affected": len(changes) + len(added) + len(dropped),
         "changes": changes, "added": added, "dropped": dropped,
     }
@@ -468,24 +493,25 @@ def rematch_preview(pid):
     if ctx is None:
         return jsonify({"error": "还没有启用的锚点，无法按锚点重匹配"}), 400
     return jsonify({"ok": True, "anchor_count": len(ctx["anchors"]),
-                    **_rematch_changes(conn, pid)})
+                    **_rematch_changes(conn, pid, ctx)})
 
 
 @app.route("/api/projects/<int:pid>/rematch", methods=["POST"])
 def rematch_apply(pid):
-    """固定锚点页，重算所有尚未确认定位号的候选；已确认/拒绝不动。"""
+    """固定锚点页，只重算相邻锚点区间内尚未确认的定位号候选；
+    区间外候选原样保留，已确认/已拒绝定位号不动。"""
     conn = get_db()
     if not conn.execute("SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone():
         return jsonify({"error": "project not found"}), 404
     ctx = build_ctx(conn, pid)
     if ctx is None:
         return jsonify({"error": "还没有启用的锚点，无法按锚点重匹配"}), 400
-    summary = _rematch_changes(conn, pid)
+    summary = _rematch_changes(conn, pid, ctx)
     ch_new = detect_chapter_starts(conn, pid, "new")
     threshold = conn.execute(
         "SELECT batch_threshold FROM projects WHERE id=?", (pid,)).fetchone()[0]
     info = run_matching(conn, pid, chapter_starts_new=ch_new, threshold=threshold,
-                        anchor_ctx=ctx)
+                        anchor_ctx=ctx, anchor_scope=True)
     conn.execute(
         "INSERT INTO meta (project_id,key,value) VALUES (?,?,?) "
         "ON CONFLICT(project_id,key) DO UPDATE SET value=excluded.value",

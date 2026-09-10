@@ -866,7 +866,9 @@ async function openRematchPreview() {
   $("#rematchModal").classList.remove("hidden");
   $("#rematchSummary").innerHTML =
     `启用锚点 <b>${r.anchor_count}</b> 个；待确认定位号 <b>${r.pending_total}</b> 条，` +
-    `其中 <b class="${r.affected ? "" : "ok-"}">${r.affected}</b> 条头名候选将发生变化。`;
+    `其中锚点区间内 <b>${r.scoped_total}</b> 条参与重算、` +
+    `<b class="${r.affected ? "" : "ok-"}">${r.affected}</b> 条头名候选将变化；` +
+    `区间外 <b>${r.preserved}</b> 条候选原样保留，不删除也不重建。`;
   const rng = c => c[0] === c[1] ? `${c[0]}` : `${c[0]}-${c[1]}`;
   const rows = [
     ...r.changes.map(c => `<tr>
@@ -892,7 +894,8 @@ async function executeRematch() {
     const r = await api(`/api/projects/${currentPid}/rematch`, { method: "POST" });
     $("#rematchModal").classList.add("hidden");
     await reloadState();
-    toast(`重匹配完成：${r.affected} 条候选变化，${r.pending_total} 条待确认已重算`, "success");
+    toast(`重匹配完成：${r.affected} 条候选变化，${r.scoped_total} 条区间内待确认重算，` +
+          `${r.preserved} 条区间外候选保留`, "success");
   } catch (e) { toast(e.message, "error"); }
 }
 
