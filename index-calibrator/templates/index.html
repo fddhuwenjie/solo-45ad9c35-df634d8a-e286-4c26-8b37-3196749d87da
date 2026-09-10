@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>换版索引校准台</title>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">📖 换版索引校准台 <span class="sub">Index Recalibration Workbench</span></div>
+  <select id="projectSelect" title="切换项目"></select>
+  <div class="actions">
+    <button data-act="sample">载入演示样例</button>
+    <button data-act="new">新建项目</button>
+    <button data-act="import" class="need-project">导入文本/CSV</button>
+    <button data-act="match" class="primary need-project" disabled>▶ 运行匹配</button>
+    <button data-act="batch" class="need-project" disabled>批量接受高置信</button>
+    <button data-act="undo" class="need-project" disabled>↩ 撤销</button>
+    <span class="menu-wrap">
+      <button data-act="export" class="need-project" disabled>导出 ▾</button>
+      <div class="menu hidden" id="exportMenu">
+        <a data-exp="csv">更新后的索引 CSV</a>
+        <a data-exp="proof">可打印校样 (HTML)</a>
+        <a data-exp="issues">未决问题报告</a>
+      </div>
+    </span>
+  </div>
+</header>
+
+<!-- 欢迎屏 -->
+<section id="welcome" class="welcome">
+  <h1>书稿换版后，索引页码逐条校准</h1>
+  <p>导入旧版与新版的<strong>分页纯文本</strong>，以及包含主条目 / 子条目 / 交叉引用 / 旧页码的 <strong>CSV</strong>。
+     应用在本地通过标题词、邻近语句与上下文指纹定位新版候选页，给出置信度与歧义原因。</p>
+  <div class="welcome-cards">
+    <div class="card">
+      <h3>① 载入内置演示样例</h3>
+      <p>一本养蜂手册：旧版 10 页 → 新版 12 页。包含换版偏移、段落拆分、跨页合并，
+         以及倒置范围、重复参见、缺失目标、主子条目矛盾等预置问题。</p>
+      <button data-act="sample" class="primary big">载入样例项目</button>
+    </div>
+    <div class="card">
+      <h3>② 使用自己的书稿</h3>
+      <ol>
+        <li>「新建项目」</li>
+        <li>「导入文本/CSV」粘贴分页文本（<code>=== PAGE n ===</code> 或 <code>^L</code> 分页）与索引 CSV</li>
+        <li>「运行匹配」后逐条确认、拒绝或改绑</li>
+      </ol>
+      <button data-act="new" class="big">新建空白项目</button>
+    </div>
+  </div>
+  <p class="local-note">所有处理均在本机完成，数据保存在本地 SQLite（data/calibrator.db），不向外部发送任何内容。</p>
+</section>
+
+<!-- 工作台 -->
+<main id="workbench" class="workbench hidden">
+
+  <div class="statsbar" id="statsBar"></div>
+
+  <div class="grid">
+
+    <!-- 左：条目 -->
+    <aside class="panel entries-panel">
+      <div class="panel-head">
+        <input id="searchBox" type="search" placeholder="搜索条目…">
+        <select id="statusFilter">
+          <option value="all">全部</option>
+          <option value="pending">待确认</option>
+          <option value="confirmed">已确认</option>
+          <option value="rejected">已拒绝</option>
+          <option value="high">高置信</option>
+          <option value="issues">有问题</option>
+        </select>
+      </div>
+      <div class="entry-list" id="entryList"></div>
+    </aside>
+
+    <!-- 中：并排页面 -->
+    <section class="panel pages-panel">
+      <div class="pages-split">
+        <div class="page-pane">
+          <div class="pane-toolbar">
+            <span class="edition-tag old">旧版</span>
+            <button class="pgnav" data-side="old" data-dir="-1">‹</button>
+            <span class="pgno" id="oldPgno">–</span>
+            <button class="pgnav" data-side="old" data-dir="1">›</button>
+            <span class="rangelinks" id="oldRangelinks"></span>
+          </div>
+          <div class="page-body" id="oldPage"><div class="placeholder">选择左侧任一条目以查看旧版页面</div></div>
+        </div>
+        <div class="page-pane">
+          <div class="pane-toolbar">
+            <span class="edition-tag new">新版</span>
+            <button class="pgnav" data-side="new" data-dir="-1">‹</button>
+            <span class="pgno" id="newPgno">–</span>
+            <button class="pgnav" data-side="new" data-dir="1">›</button>
+            <span class="rangelinks" id="newRangelinks"></span>
+          </div>
+          <div class="page-body" id="newPage"><div class="placeholder">候选命中将在此高亮</div></div>
+        </div>
+      </div>
+      <div class="legend">
+        <span><mark class="term">条目词</mark></span>
+        <span><mark class="hit">邻近语句 / 指纹命中</mark></span>
+        <span class="lg-text">点击左侧条目定位；点击右侧候选可切换高亮页。</span>
+      </div>
+    </section>
+
+    <!-- 右：检查器 -->
+    <aside class="panel inspector">
+      <div class="tabs">
+        <button class="tab active" data-tab="inspect">候选</button>
+        <button class="tab" data-tab="issues">问题 <em id="issueCount">0</em></button>
+        <button class="tab" data-tab="versions">版本</button>
+        <button class="tab" data-tab="settings">规则</button>
+      </div>
+
+      <div class="tab-body" id="tab-inspect">
+        <div id="inspectContent"><p class="muted">在左侧选择一个页码定位号。</p></div>
+      </div>
+      <div class="tab-body hidden" id="tab-issues">
+        <div id="issuesContent"></div>
+      </div>
+      <div class="tab-body hidden" id="tab-versions">
+        <div class="snap-row">
+          <input id="snapName" placeholder="命名当前版本…">
+          <button id="snapBtn">存版本</button>
+        </div>
+        <h4>命名版本（可回滚）</h4>
+        <div id="snapList"></div>
+        <h4>操作历史（逐条撤销）</h4>
+        <div id="historyList"></div>
+      </div>
+      <div class="tab-body hidden" id="tab-settings">
+        <label>章节起始页规则
+          <select id="setPolicy">
+            <option value="any">任意页</option>
+            <option value="recto">右页（奇数页 recto）</option>
+            <option value="even">左页（偶数页）</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="setCross"> 允许页码范围跨越章节边界（关闭后跨章范围报问题）</label>
+        <label>章节标题识别正则
+          <input id="setRegex" class="mono">
+        </label>
+        <label>批量接受置信阈值
+          <input type="number" id="setThreshold" min="0.5" max="1" step="0.01">
+        </label>
+        <p class="muted small">新版检测到的章节起始页：<span id="setChapters" class="mono"></span></p>
+        <button id="settingsSave" class="primary">保存规则并重检</button>
+      </div>
+    </aside>
+  </div>
+</main>
+
+<!-- 导入弹窗 -->
+<div class="modal-mask hidden" id="importModal">
+  <div class="modal wide">
+    <h2>导入分页文本与索引 CSV</h2>
+    <div class="imp-grid">
+      <div>
+        <h3>分页纯文本（旧版 / 新版）</h3>
+        <p class="muted small">分页标记：单独一行 <code>=== PAGE 3 ===</code>（也支持「页码 3」、换页符 ^L）。</p>
+        <label>版本
+          <select id="impEdition">
+            <option value="old">旧版</option>
+            <option value="new">新版</option>
+          </select>
+        </label>
+        <textarea id="impText" rows="10" placeholder="=== PAGE 1 ===&#10;第一章 …&#10;&#10;=== PAGE 2 ===&#10;…"></textarea>
+      </div>
+      <div>
+        <h3>索引 CSV</h3>
+        <p class="muted small">列：<code>term, subterm, kind(term/see/seealso), target, pages</code>；
+           pages 用分号分隔，如 <code>7; 12-14</code>。</p>
+        <textarea id="impCsv" rows="10" placeholder="term,subterm,kind,target,pages&#10;Honey,,term,,9&#10;Honey,varietals,term,,9-10"></textarea>
+      </div>
+    </div>
+    <label class="check"><input type="radio" name="impMode" value="replace" checked> 替换该版本/条目</label>
+    <label class="check"><input type="radio" name="impMode" value="append"> 追加到现有数据</label>
+    <div class="modal-foot">
+      <button data-close="importModal">取消</button>
+      <button id="impDo" class="primary">导入</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
