@@ -153,32 +153,40 @@ def validate(conn, project_id):
                 _add(issues, "missing_target", e["id"], None,
                      f"{label} {arrow}“{target}”，但索引中不存在该目标条目")
 
-    # 3) 主/子条目页码矛盾（以已确认新范围为准，否则回退旧范围）
+    # 3) 主/子条目页码矛盾。
+    #    必须在同一版本轴内比较：主条目已确认新版页时，不能与仍待确认的
+    #    子条目旧版页跨版本混比（换版偏移/拆分/合并会造成假矛盾）。
     parents = {}
     for e in entries:
         if not e["subterm"]:
             parents[e["term"]] = e["id"]
 
-    def _spans(entry_id):
-        out = []
+    def _spans_by_edition(entry_id):
+        """返回 {'新版': [(s,e)], '旧版': [(s,e)]}；已确认的只收集新版。"""
+        out = {"新版": [], "旧版": []}
         for loc in by_entry.get(entry_id, []):
             if loc["new_start"] is not None:
-                out.append((loc["new_start"], loc["new_end"] or loc["new_start"], "新版"))
+                out["新版"].append((loc["new_start"], loc["new_end"] or loc["new_start"]))
             else:
-                out.append((loc["old_start"], loc["old_end"] or loc["old_start"], "旧版"))
+                out["旧版"].append((loc["old_start"], loc["old_end"] or loc["old_start"]))
         return out
 
     for e in entries:
         if not e["subterm"] or e["term"] not in parents:
             continue
-        pspans = _spans(parents[e["term"]])
-        cspans = _spans(e["id"])
-        for cs, ce, which in cspans:
-            covered = any(ps <= cs and ce <= pe for ps, pe, _ in pspans)
-            if pspans and not covered:
-                _add(issues, "subterm_contradiction", e["id"], None,
-                     f"{_entry_label(e)} 的{which}页 {cs}-{ce} 落在主条目“{e['term']}”"
-                     f"全部范围之外")
+        parent_spans = _spans_by_edition(parents[e["term"]])
+        child_spans = _spans_by_edition(e["id"])
+        for which in ("新版", "旧版"):
+            pspans, cspans = parent_spans[which], child_spans[which]
+            if not pspans or not cspans:
+                # 父子分处不同版本轴时无法直接比较，跳过避免跨版本误报
+                continue
+            for cs, ce in cspans:
+                covered = any(ps <= cs and ce <= pe for ps, pe in pspans)
+                if not covered:
+                    _add(issues, "subterm_contradiction", e["id"], None,
+                         f"{_entry_label(e)} 的{which}页 {cs}-{ce} 落在主条目“{e['term']}”"
+                         f"全部{which}范围之外")
 
     # 4) 章节起始页本身（新版每个章节首页的奇偶规则）
     if proj["chapter_policy"] in ("recto", "even"):
@@ -190,7 +198,7 @@ def validate(conn, project_id):
                 _add(issues, "chapter_parity", None, None,
                      f"新版章节从第 {c} 页（奇数页）开始，规则要求左页（偶数页）")
 
-    # ---- 写库：已不存在的问题标记 resolved，新问题插入 ----
+    # ---- 写库：已不存在的问题标记 resolved；重新出现的问题从 resolved 重开 ----
     existing = {
         (r["code"], r["entry_id"], r["locator_id"], r["message"]): r
         for r in conn.execute("SELECT * FROM issues WHERE project_id=?", (project_id,))
@@ -199,12 +207,18 @@ def validate(conn, project_id):
     for it in issues:
         key = (it["code"], it["entry_id"], it["locator_id"], it["message"])
         current_keys.add(key)
-        if key not in existing:
+        row = existing.get(key)
+        if row is None:
             conn.execute(
                 "INSERT INTO issues (project_id, code, severity, entry_id, locator_id, message)"
                 " VALUES (?,?,?,?,?,?)",
                 (project_id, it["code"], it["severity"], it["entry_id"],
                  it["locator_id"], it["message"]))
+        elif row["status"] != "open":
+            # 同一问题此前已解决，条件再次满足（如规则改回 recto）时重新打开
+            conn.execute(
+                "UPDATE issues SET status='open', severity=? WHERE id=?",
+                (it["severity"], row["id"]))
     for key, row in existing.items():
         if key not in current_keys and row["status"] == "open":
             conn.execute("UPDATE issues SET status='resolved' WHERE id=?", (row["id"],))

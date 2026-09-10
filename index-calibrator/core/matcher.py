@@ -198,34 +198,14 @@ def run_matching(conn, project_id, only_locator_ids=None, chapter_starts_new=Non
         conn.execute("UPDATE locators SET anchor=? WHERE id=?",
                      (" | ".join(a[:120] for a in anchors), loc["id"]))
 
-        scored = {nno: _score_page(old, window_nos, new[nno], anchors, terms)
-                  for nno in new_nos}
-
-        # --- 三种候选方法 ---
-        raw_cands = []
-
-        mapped_targets = sorted({mapping.get(n) for n in window_nos} - {None})
-        if mapped_targets:
-            ms, me = min(mapped_targets), max(mapped_targets)
-            raw_cands.append((ms, me, "mapped"))
-
-        if global_offset is not None and offset_ratio >= 0.5:
-            os_, oe = s + global_offset, e + global_offset
-            if os_ in new and oe in new:
-                raw_cands.append((os_, oe, "offset"))
-
         length = e - s + 1
         window_sh = set()
         for ono in window_nos:
             window_sh |= old[ono]["sh"]
 
-        def range_quality(start, cand_len):
-            """范围级质量。
-
-            相似度必须双向：recall 是旧窗口指纹在候选块中的覆盖率，
-            precision 是候选块指纹真正属于旧窗口的比例——后者惩罚把
-            承载相邻内容的页面（如段落拆分后的邻页）纳入范围。
-            """
+        def block_metrics(start, cand_len):
+            """候选块的各项指标（相似度必须双向：recall=旧内容覆盖率，
+            precision=块中指纹真正属于旧窗口的比例，惩罚吸入相邻无关页）。"""
             block = [n for n in range(start, start + cand_len) if n in new]
             if len(block) != cand_len:
                 return None
@@ -235,8 +215,7 @@ def run_matching(conn, project_id, only_locator_ids=None, chapter_starts_new=Non
                 np = new[n]
                 merged_sh |= np["sh"]
                 cover_anchor = max(cover_anchor, _anchor_score(anchors, np, terms))
-                tnorm = np["norm"]
-                if terms and any(t in tnorm for t in terms):
+                if terms and any(t in np["norm"] for t in terms):
                     term_pages += 1
                 tn = normalize(np["title"])
                 if terms and any(t in tn for t in terms):
@@ -249,63 +228,95 @@ def run_matching(conn, project_id, only_locator_ids=None, chapter_starts_new=Non
             f1 = (2 * precision * recall / (precision + recall)) if precision + recall else 0.0
             mean_pair = sum(pair_acc) / len(pair_acc) if pair_acc else 0.0
             sim = 0.5 * f1 + 0.5 * mean_pair
-            term_frac = term_pages / cand_len
-            title_frac = title_pages / cand_len
-            q = W_SIM * sim + W_ANCHOR * cover_anchor + W_TERM * term_frac + W_TITLE * title_frac
-            # 扩张窗口惩罚：多纳入的页面应确实承载旧内容（惩罚要温和，
-            # 否则真正的“旧1页拆成新2页”也会被惩罚掉）；
-            # 但高召回（>=0.85）说明旧内容几乎都在块中，是真正的拆分，给扩张奖励。
-            if cand_len > length and recall >= 0.93:
-                q += 0.06
-            else:
-                q -= 0.015 * max(0, cand_len - length)
+            return {
+                "recall": recall, "sim": sim, "anchor": cover_anchor,
+                "term_frac": term_pages / cand_len,
+                "title_frac": title_pages / cand_len,
+                "cand_len": cand_len,
+            }
+
+        def quality(m, base_recall=None, gate_split=False):
+            q = W_SIM * m["sim"] + W_ANCHOR * m["anchor"] \
+                + W_TERM * m["term_frac"] + W_TITLE * m["title_frac"]
+            extra = m["cand_len"] - length
+            if extra > 0:
+                # 真拆分判定：只有当“不扩张时召回本来就不全”（<0.8），
+                # 且扩张带来显著边际召回（>=0.3）时，新增页面才确实承载了
+                # 旧窗口的缺失内容；否则视为吸入相邻页，扩张候选直接不成立。
+                marginal = m["recall"] - (base_recall if base_recall is not None else 0.0)
+                is_split = base_recall is not None and base_recall < 0.8 and marginal >= 0.3
+                if gate_split and not is_split:
+                    return None
+                if is_split:
+                    q += 0.06
+                else:
+                    q -= 0.015 * extra
             return q
 
-        # window 候选：L-1/L/L+1 长度下各自取范围质量最高的起点
-        for cand_len in {max(1, length - 1), length, min(len(new), length + 1)}:
-            best_start, best_q = None, -1.0
+        # 各候选长度下的最优块与其召回率（供扩张候选计算边际召回）
+        lens = sorted({max(1, length - 1), length, min(len(new), length + 1)})
+        best_by_len = {}
+        for cand_len in lens:
+            best_start, best_m, best_q = None, None, -1.0
             for start in new_nos:
-                q = range_quality(start, cand_len)
-                if q is not None and q > best_q:
-                    best_start, best_q = start, q
+                m = block_metrics(start, cand_len)
+                if m is None:
+                    continue
+                q = quality(m)
+                if q > best_q:
+                    best_start, best_m, best_q = start, m, q
             if best_start is not None:
-                raw_cands.append((best_start, best_start + cand_len - 1, "window"))
+                best_by_len[cand_len] = (best_start, best_m, best_q)
+        base_recall = best_by_len[length][1]["recall"] if length in best_by_len else None
+
+        # --- 三种候选方法 ---
+        raw_cands = []
+
+        mapped_targets = sorted({mapping.get(n) for n in window_nos} - {None})
+        if mapped_targets:
+            ms, me = min(mapped_targets), max(mapped_targets)
+            mm = block_metrics(ms, me - ms + 1)
+            if mm is not None:
+                qq = quality(mm, base_recall, gate_split=(mm["cand_len"] > length))
+                if qq is not None:
+                    raw_cands.append((ms, me, "mapped", qq))
+
+        if global_offset is not None and offset_ratio >= 0.5:
+            os_, oe = s + global_offset, e + global_offset
+            if os_ in new and oe in new:
+                om = block_metrics(os_, oe - os_ + 1)
+                if om is not None:
+                    qq = quality(om, base_recall, gate_split=(om["cand_len"] > length))
+                    if qq is not None:
+                        raw_cands.append((os_, oe, "offset", qq))
+
+        # window 候选：非扩张长度直接取最优；扩张长度仅在真拆分时成立
+        for cand_len in lens:
+            best_start, best_m, _ = best_by_len[cand_len]
+            if cand_len > length:
+                qq = quality(best_m, base_recall, gate_split=True)
+                if qq is None:
+                    continue
+            else:
+                qq = quality(best_m, base_recall)
+            raw_cands.append((best_start, best_start + cand_len - 1, "window", qq))
 
         # 去重并计算范围分（合并方法标签）
-        merged, seen_methods = [], {}
-        for cs, ce, method in raw_cands:
-            key = (cs, ce)
-            seen_methods.setdefault(key, []).append(method)
+        seen_methods = {}
+        for cs, ce, method, _q in raw_cands:
+            seen_methods.setdefault((cs, ce), []).append(method)
 
-        def range_score(cs, ce):
-            block = [n for n in range(cs, ce + 1) if n in new]
-            merged_sh = set()
-            cover_anchor, term_pages, pair_acc = 0, 0, []
-            for n in block:
-                np = new[n]
-                merged_sh |= np["sh"]
-                cover_anchor = max(cover_anchor, _anchor_score(anchors, np, terms))
-                if terms and any(t in np["norm"] for t in terms):
-                    term_pages += 1
-                for ono in window_nos:
-                    pair_acc.append(0.5 * jaccard(old[ono]["sh"], np["sh"])
-                                    + 0.5 * containment(old[ono]["sh"], np["sh"]))
-            recall = containment(window_sh, merged_sh) if window_sh else 0.0
-            precision = containment(merged_sh, window_sh) if merged_sh else 0.0
-            f1 = (2 * precision * recall / (precision + recall)) if precision + recall else 0.0
-            mean_pair = sum(pair_acc) / len(pair_acc) if pair_acc else 0.0
-            sim = 0.5 * f1 + 0.5 * mean_pair
-            q = W_SIM * sim + W_ANCHOR * cover_anchor + W_TERM * (term_pages / len(block))
-            cand_len = ce - cs + 1
-            if cand_len > length and recall >= 0.93:
-                q += 0.06
-            return min(1.0, q), recall
-
+        merged = []
         for (cs, ce), methods in seen_methods.items():
-            rscore, cover = range_score(cs, ce)
+            m = block_metrics(cs, ce - cs + 1)
+            rscore = quality(m, base_recall, gate_split=(m["cand_len"] > length))
+            if rscore is None:
+                continue
+            rscore = min(1.0, rscore)
             method = "combined" if len(set(methods)) > 1 else methods[0]
             merged.append({"start": cs, "end": ce, "method": method,
-                           "score": round(rscore, 4), "coverage": round(cover, 3)})
+                           "score": round(rscore, 4), "coverage": round(m["recall"], 3)})
+
         merged.sort(key=lambda c: c["score"], reverse=True)
         cands = merged[:4]
 

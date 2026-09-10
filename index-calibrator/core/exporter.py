@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """三种成果物导出：更新后的索引 CSV、可打印校样 HTML、未决问题报告。"""
 import csv
+import html
 import io
 import json
 
@@ -53,9 +54,10 @@ def export_csv(conn, project_id):
 def export_proof_html(conn, project_id):
     proj = conn.execute("SELECT name FROM projects WHERE id=?", (project_id,)).fetchone()
     rows = _entry_rows(conn, project_id)
+    e = html.escape
     out = io.StringIO()
     out.write(f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
-<title>索引校样 — {proj['name']}</title>
+<title>索引校样 — {e(proj['name'])}</title>
 <style>
 @page {{ margin: 22mm 18mm; }}
 body {{ font-family: Georgia, 'Songti SC', serif; color:#111; line-height:1.5; }}
@@ -71,20 +73,20 @@ h1 {{ font-size: 20pt; border-bottom:2px solid #111; padding-bottom:6pt; }}
 table.meta {{ font-size:9pt; border-collapse:collapse; margin-bottom:10pt; }}
 table.meta td {{ border:1px solid #999; padding:2pt 8pt; }}
 </style></head><body>
-<h1>换版索引校样：{proj['name']}</h1>
+<h1>换版索引校样：{e(proj['name'])}</h1>
 """)
     current_letter = None
-    for e in rows:
+    for row in rows:
         locs = conn.execute(
-            "SELECT * FROM locators WHERE entry_id=? ORDER BY old_start", (e["id"],)).fetchall()
-        letter = e["term"][:1].upper()
+            "SELECT * FROM locators WHERE entry_id=? ORDER BY old_start", (row["id"],)).fetchall()
+        letter = row["term"][:1].upper()
         if letter != current_letter:
             current_letter = letter
-            out.write(f'<div class="letter">{letter}</div>\n')
-        cls = "term" if not e["subterm"] else "sub"
-        out.write(f'<div class="{cls}"><b>{e["term"]}</b>')
-        if e["subterm"]:
-            out.write(f', {e["subterm"]}')
+            out.write(f'<div class="letter">{e(letter)}</div>\n')
+        cls = "term" if not row["subterm"] else "sub"
+        out.write(f'<div class="{cls}"><b>{e(row["term"])}</b>')
+        if row["subterm"]:
+            out.write(f', {e(row["subterm"])}')
         page_bits = []
         for l in locs:
             if l["new_start"] is not None:
@@ -96,14 +98,14 @@ table.meta td {{ border:1px solid #999; padding:2pt 8pt; }}
             else:
                 page_bits.append(
                     f'<span class="pending">[待确认 旧{_format_range(l["old_start"], l["old_end"])}]</span>')
-        if e["kind"] in ("see", "seealso") and e["ref_target"]:
-            word = "参见" if e["kind"] == "seealso" else "见"
-            page_bits.append(f'<span class="xref">{word} {e["ref_target"]}</span>')
+        if row["kind"] in ("see", "seealso") and row["ref_target"]:
+            word = "参见" if row["kind"] == "seealso" else "见"
+            page_bits.append(f'<span class="xref">{word} {e(row["ref_target"])}</span>')
         if page_bits:
             out.write(", " + ", ".join(page_bits))
         out.write("</div>\n")
     out.write("</body></html>")
-    return out.get()
+    return out.getvalue()
 
 
 def export_issues(conn, project_id, fmt="txt"):
