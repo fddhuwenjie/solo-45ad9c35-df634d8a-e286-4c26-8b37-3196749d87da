@@ -46,7 +46,8 @@ function rangeText(l, prefix = "") {
 function confClass(c) { return c === "high" ? "high" : c === "medium" ? "medium" : "low"; }
 function confLabel(c) { return c === "high" ? "高置信" : c === "medium" ? "中置信" : "低置信"; }
 function methodLabel(m) {
-  return { mapped: "逐页映射", offset: "全书偏移", window: "窗口滑选", combined: "综合" }[m] || m;
+  return { mapped: "逐页映射", offset: "全书偏移", window: "窗口滑选",
+           combined: "综合", anchor: "页对照锚点" }[m] || m;
 }
 
 /* ---------------- 启动 ---------------- */
@@ -119,7 +120,7 @@ function bindChrome() {
     const list = S.pages[side];
     const idx = list.findIndex(p => p.page_no === pagePos[side]);
     const next = list[Math.min(list.length - 1, Math.max(0, idx + dir))];
-    if (next) { pagePos[side] = next.page_no; renderPage(side); }
+    if (next) { pagePos[side] = next.page_no; renderPage(side); renderAnchorBadges(); }
   }));
 
   $("#searchBox").addEventListener("input", renderEntries);
@@ -127,9 +128,10 @@ function bindChrome() {
 
   $$(".tab").forEach(t => t.addEventListener("click", () => {
     $$(".tab").forEach(x => x.classList.toggle("active", x === t));
-    ["inspect", "issues", "versions", "settings"].forEach(name =>
+    ["inspect", "anchors", "issues", "versions", "settings"].forEach(name =>
       $("#tab-" + name).classList.toggle("hidden", name !== t.dataset.tab));
     if (t.dataset.tab === "versions") renderVersions();
+    if (t.dataset.tab === "anchors") renderAnchors();
     if (t.dataset.tab === "issues") renderIssues();
     if (t.dataset.tab === "settings") fillSettings();
   }));
@@ -140,6 +142,13 @@ function bindChrome() {
   $("#impDo").addEventListener("click", doImport);
   $("#snapBtn").addEventListener("click", doSnapshot);
   $("#settingsSave").addEventListener("click", saveSettings);
+
+  // 锚点快捷条 / 重匹配弹窗
+  $("#setAnchorBtn").addEventListener("click", createAnchorFromPages);
+  $("#anchorQuickNote").addEventListener("keydown", e => {
+    if (e.key === "Enter") createAnchorFromPages();
+  });
+  $("#rematchDo").addEventListener("click", executeRematch);
 }
 
 async function onAction(act) {
@@ -222,7 +231,9 @@ function renderAll() {
   renderEntries();
   renderInspector();
   renderIssuesBadge();
+  renderAnchorBadges();
   renderPages();
+  if (!$("#tab-anchors").classList.contains("hidden")) renderAnchors();
 }
 
 function renderStats() {
@@ -385,6 +396,7 @@ function renderPages() {
   $("#oldPgno").textContent = pagePos.old ?? "–";
   $("#newPgno").textContent = pagePos.new ?? "–";
   renderRangeLinks();
+  renderAnchorBadges();
   renderPage("old");
   renderPage("new");
 }
@@ -409,6 +421,7 @@ function renderRangeLinks() {
     pagePos[b.dataset.side] = +b.dataset.page;
     renderPage(b.dataset.side);
     $(`#${b.dataset.side}Pgno`).textContent = pagePos[b.dataset.side];
+    renderAnchorBadges();
   }));
 }
 
@@ -441,9 +454,27 @@ async function renderPage(side) {
   }
   const hitSents = (shownHighlights[side][no] || []).slice();
   const inRange = selectedLoc && inLocatorRange(side, no);
+  const anc = anchorAt(side, no), seg = segmentOf(side, no);
+  const pane = box.closest(".page-pane");
+  if (pane) {
+    pane.classList.remove(...[...pane.classList].filter(c => c.startsWith("seg-c")));
+    if (seg) pane.classList.add("seg-c" + seg.index % 6);
+    pane.classList.toggle("is-anchor-page", !!anc);
+  }
+  let anchorBanner = "";
+  if (anc) {
+    const other = side === "old" ? anc.new_page : anc.old_page;
+    anchorBanner = `<div class="anchor-banner">⚓ 锚点页：${side === "old" ? "旧" : "新"}${no} 固定对应${side === "old" ? "新" : "旧"}${other}
+      ${anc.note ? ` · ${esc(anc.note)}` : ""}</div>`;
+  } else if (seg) {
+    const kindName = { head: "首段外推", tail: "尾段外推", interval: "锚点区间", single: "单锚平移" }[seg.kind] || "";
+    anchorBanner = `<div class="seg-banner seg-c${seg.index % 6}">映射区间 ${seg.index}（${kindName}）：
+      旧 ${seg.old_start}–${seg.old_end} → 新 ${seg.new_start ?? "?"}–${seg.new_end ?? "?"}</div>`;
+  }
   box.innerHTML =
     `<div class="page-label">${badge} ${side === "old" ? "旧版" : "新版"} · 第 ${no} 页
       ${inRange ? '<span class="tag combined">当前定位范围</span>' : ""}</div>` +
+    anchorBanner +
     highlightContent(page.content, termWords, hitSents);
 }
 
@@ -528,11 +559,15 @@ function renderInspector() {
 
   let candHtml = "";
   if (c) {
+    const aNotes = (c.anchor_notes || []).map(n =>
+      `<li class="anchor-note" title="${esc(n[0])}">${esc(n[1])}</li>`).join("");
     candHtml = `
       <div class="conf-bar"><i class="${confClass(c.confidence)}"
         style="width:${Math.round((c.score || 0) * 100)}%"></i></div>
       <div class="${confClass(c.confidence)}"><b>${confLabel(c.confidence)}</b>
-        · 综合分 ${(c.score || 0).toFixed(2)} · 方法 ${methodLabel(c.method)}</div>`;
+        · 综合分 ${(c.score || 0).toFixed(2)} · 方法 ${methodLabel(c.method)}
+        ${c.anchor_pinned ? '<span class="tag anchor-tag">⚓ 锚点固定</span>' : ""}</div>
+      ${aNotes ? `<ul class="anchor-notes">${aNotes}</ul>` : ""}`;
     if (c.reasons && c.reasons.length) {
       candHtml += `<ul class="reasons">${c.reasons.map(r =>
         `<li title="${esc(r[0])}">${esc(r[1])}</li>`).join("")}</ul>`;
@@ -620,6 +655,247 @@ async function decide(locatorId, action, extra = {}) {
   } catch (e) { toast(e.message, "error"); }
 }
 
+/* ---------------- 页对照锚点 ---------------- */
+
+function A() { return (S && S.anchors) || { anchors: [], segments: [], page_map: {}, conflicts: [] }; }
+function activeAnchors() { return A().anchors.filter(a => a.status === "active"); }
+
+function anchorAt(side, pageNo) {
+  if (!pageNo) return null;
+  return activeAnchors().find(a => a[side === "old" ? "old_page" : "new_page"] === pageNo) || null;
+}
+
+function segmentOf(side, pageNo) {
+  const segs = A().segments, pmap = A().page_map;
+  if (!segs.length || pageNo == null) return null;
+  if (side === "old") {
+    return segs.find(g => pageNo >= g.old_start && pageNo <= g.old_end) || null;
+  }
+  // 新页：找其反投影落入的区间
+  for (const g of segs) {
+    if (g.new_start == null) continue;
+    if (pageNo >= Math.min(g.new_start, g.new_end) && pageNo <= Math.max(g.new_start, g.new_end))
+      return g;
+  }
+  // 外推段超出投影页时按最近锚点归类
+  return null;
+}
+
+function renderAnchorBadges() {
+  if (!S) return;
+  for (const side of ["old", "new"]) {
+    const no = pagePos[side], a = anchorAt(side, no), seg = segmentOf(side, no);
+    const badge = $("#" + side + "AnchorBadge");
+    badge.innerHTML = "";
+    if (a) {
+      const cls = side === "old" ? "old" : "new";
+      badge.innerHTML = `<span class="anc-badge ${cls}" title="页对照锚点">⚓ 旧${a.old_page}→新${a.new_page}</span>`;
+    } else if (seg) {
+      badge.innerHTML = `<span class="seg-badge seg-c${seg.index % 6}" title="所属映射区间">区间 ${seg.index}</span>`;
+    }
+  }
+  const qb = A();
+  const act = qb.anchors.filter(a => a.status === "active").length;
+  $("#anchorCount").textContent = act;
+  $("#qbOld").textContent = pagePos.old ?? "–";
+  $("#qbNew").textContent = pagePos.new ?? "–";
+  const dupPair = qb.anchors.some(a =>
+    a.old_page === pagePos.old && a.new_page === pagePos.new);
+  const btn = $("#setAnchorBtn");
+  btn.disabled = !pagePos.old || !pagePos.new || dupPair;
+  btn.textContent = dupPair ? "⚓ 这对页已是锚点" : "⚓ 把当前两页设为对照锚点";
+}
+
+async function createAnchorFromPages() {
+  const oldPage = pagePos.old, newPage = pagePos.new;
+  const note = $("#anchorQuickNote").value.trim();
+  if (!oldPage || !newPage) { toast("请先在两侧选定页面", "error"); return; }
+  try {
+    const r = await api(`/api/projects/${currentPid}/anchors`, {
+      method: "POST", body: { old_page: oldPage, new_page: newPage, note, active: true },
+    });
+    S.anchors = r;
+    $("#anchorQuickNote").value = "";
+    renderAll();
+    toast(`已设锚点 旧${oldPage}→新${newPage}；单调分段映射已更新`, "success");
+  } catch (e) {
+    // 被拒绝（倒退/重复/越界）：提供“保存为停用锚点”的选择，便于稍后调整
+    if (confirm(`锚点被拒绝：${e.message}\n\n仍要保存为「停用」锚点（在锚点面板中可调整后再启用）吗？`)) {
+      try {
+        const r = await api(`/api/projects/${currentPid}/anchors`, {
+          method: "POST", body: { old_page: oldPage, new_page: newPage, note, active: false },
+        });
+        S.anchors = r;
+        $("#anchorQuickNote").value = "";
+        renderAll();
+        toast("已保存为停用锚点，可在锚点面板启用", "");
+      } catch (e2) { toast(e2.message, "error"); }
+    }
+  }
+}
+
+function renderAnchors() {
+  const box = $("#anchorsContent");
+  if (!S) return;
+  const qb = A();
+  const act = qb.anchors.filter(a => a.status === "active");
+  const dis = qb.anchors.filter(a => a.status !== "active");
+
+  let segHtml = "";
+  if (qb.segments.length) {
+    segHtml = `<h4>单调分段映射（${act.length} 个启用锚点）</h4>
+      <div class="seg-list">${qb.segments.map(g => {
+        const kindName = { head: "首段外推", tail: "尾段外推", interval: "锚点区间", single: "单锚平移" }[g.kind];
+        const slope = g.slope == null ? "" :
+          ` · 斜率 ${g.slope === 1 ? "1（平移）" : g.slope.toFixed(2)} 页/页`;
+        return `<div class="seg-row seg-c${g.index % 6}">
+          <b>区间 ${g.index}</b> <span class="tag">${kindName}</span>
+          旧 ${g.old_start}–${g.old_end} → 新 ${g.new_start ?? "?"}–${g.new_end ?? "?"}
+          <span class="muted small">${slope}</span></div>`;
+      }).join("")}</div>`;
+  }
+
+  const rowHtml = (a) => `
+    <div class="anchor-row ${a.status}" data-aid="${a.id}">
+      <div class="ar-head">
+        <span class="ar-pages">⚓ 旧<b>${a.old_page}</b> → 新<b>${a.new_page}</b></span>
+        <span class="ar-actions">
+          <button data-aact="toggle" data-aid="${a.id}">${a.status === "active" ? "停用" : "启用"}</button>
+          <button data-aact="delete" data-aid="${a.id}">删除</button>
+        </span>
+      </div>
+      <input class="ar-note" data-aid="${a.id}" value="${esc(a.note || "")}"
+        placeholder="备注…（回车保存）">
+      ${a.status === "active" ? "" : '<span class="tag disabled-tag">已停用 · 不参与映射</span>'}
+    </div>`;
+
+  let conflictsHtml = "";
+  if (qb.conflicts.length) {
+    conflictsHtml = `<h4>冲突与漂移（${qb.conflicts.length}）</h4>
+      <div class="anchor-conflicts">${qb.conflicts.map(c => conflictHtml(c)).join("")}</div>`;
+  }
+
+  box.innerHTML = `
+    <div class="anchor-intro small muted">在中间并排预览中翻到对应页，点击
+      「⚓ 把当前两页设为对照锚点」即可建立对照点并填写备注。启用锚点的旧页、新页
+      都必须严格递增；重匹配时锚点页固定，只重算相邻区间内未确认的定位号。</div>
+    <div class="anchor-toolbar">
+      <button id="rematchPreviewBtn" class="primary" ${act.length ? "" : "disabled"}>
+        ▶ 按锚点重匹配（先预览）</button>
+      <button id="anchorExportBtn">导出对照表 JSON</button>
+    </div>
+    ${segHtml}
+    <h4>启用锚点</h4>
+    <div id="activeAnchorList">${act.map(rowHtml).join("") || '<p class="muted small">尚无启用锚点。</p>'}</div>
+    ${dis.length ? `<h4>停用锚点</h4><div id="disabledAnchorList">${dis.map(rowHtml).join("")}</div>` : ""}
+    ${conflictsHtml}`;
+
+  $("#rematchPreviewBtn")?.addEventListener("click", openRematchPreview);
+  $("#anchorExportBtn")?.addEventListener("click", () =>
+    window.open(`/api/projects/${currentPid}/export/anchors`, "_blank"));
+  $$("#anchorsContent [data-aact]").forEach(b => b.addEventListener("click", () =>
+    anchorAction(+b.dataset.aid, b.dataset.aact)));
+  $$("#anchorsContent .ar-note").forEach(inp => {
+    inp.addEventListener("keydown", e => {
+      if (e.key === "Enter") { e.preventDefault(); saveAnchorNote(+inp.dataset.aid, inp.value); }
+    });
+    inp.addEventListener("blur", () => {
+      const cur = A().anchors.find(a => a.id === +inp.dataset.aid);
+      if (cur && (cur.note || "") !== inp.value.trim()) saveAnchorNote(+inp.dataset.aid, inp.value, true);
+    });
+  });
+}
+
+function conflictHtml(c) {
+  if (c.kind === "disabled_anchor") {
+    return `<div class="conf-item disabled" data-aid="${c.anchor_id}">
+      <span class="sev-badge warning">停用锚点</span>
+      旧${c.old_page}→新${c.new_page}：${esc(c.message)}
+      ${c.note ? `<div class="small muted">备注：${esc(c.note)}</div>` : ""}
+      <button data-aact="delete" data-aid="${c.anchor_id}">删除</button></div>`;
+  }
+  const kind = c.kind === "confirmed_drift"
+    ? '<span class="sev-badge error">已确认漂移</span>'
+    : '<span class="sev-badge warning">候选漂移</span>';
+  return `<div class="conf-item drift" data-loc="${c.locator_id}">
+    ${kind} <b>${esc((c.subterm ? c.term + " — " + c.subterm : c.term))}</b>
+    旧${c.old_range[0] === c.old_range[1] ? c.old_range[0] : c.old_range.join("-")}：
+    当前新 ${c.actual_range.join("-")}，锚点投影区间 新${c.expected_range.join("-")}
+    <div class="small muted">${esc(c.message)}</div></div>`;
+}
+
+async function anchorAction(aid, act) {
+  try {
+    if (act === "delete") {
+      if (!confirm("删除该锚点？（可随后用顶栏「撤销」恢复）")) return;
+      const r = await api(`/api/anchors/${aid}`, { method: "DELETE" });
+      S.anchors = r;
+    } else if (act === "toggle") {
+      const r = await api(`/api/anchors/${aid}/toggle`, { method: "POST" });
+      S.anchors = r;
+      toast(r.status === "active" ? "锚点已启用，映射已扩展" : "锚点已停用", "success");
+    }
+    renderAll();
+  } catch (e) {
+    toast(e.message, "error");
+    // 启用失败（与现有锚点冲突）时刷新面板，让用户看到最新状态
+    const fresh = await api(`/api/projects/${currentPid}/anchors`);
+    S.anchors = fresh;
+    renderAll();
+  }
+}
+
+async function saveAnchorNote(aid, note, quiet) {
+  const r = await api(`/api/anchors/${aid}/note`, {
+    method: "POST", body: { note: note.trim() },
+  });
+  S.anchors = r;
+  renderAll();
+  if (!quiet) toast("备注已保存", "success");
+}
+
+/* ---------------- 锚点重匹配（预览 + 执行） ---------------- */
+
+async function openRematchPreview() {
+  if (!activeAnchors().length) { toast("还没有启用的锚点", "error"); return; }
+  toast("正在按锚点在后台试算（不改动当前数据）…");
+  let r;
+  try {
+    r = await api(`/api/projects/${currentPid}/rematch/preview`, { method: "POST" });
+  } catch (e) { toast(e.message, "error"); return; }
+  $("#rematchModal").classList.remove("hidden");
+  $("#rematchSummary").innerHTML =
+    `启用锚点 <b>${r.anchor_count}</b> 个；待确认定位号 <b>${r.pending_total}</b> 条，` +
+    `其中 <b class="${r.affected ? "" : "ok-"}">${r.affected}</b> 条头名候选将发生变化。`;
+  const rng = c => c[0] === c[1] ? `${c[0]}` : `${c[0]}-${c[1]}`;
+  const rows = [
+    ...r.changes.map(c => `<tr>
+      <td>${esc(c.label)} <span class="muted">旧${rng(c.old_locator)}</span></td>
+      <td class="cell-before">新${rng(c.before)} <span class="small muted">${methodLabel(c.before_method)}</span></td>
+      <td class="cell-arrow">→</td>
+      <td class="cell-after">新${rng(c.after)} <span class="small muted">${methodLabel(c.after_method)}</span></td></tr>`),
+    ...r.added.map(c => `<tr><td>${esc(c.label)}</td>
+      <td class="cell-before muted">无候选</td><td class="cell-arrow">→</td>
+      <td class="cell-after">新${rng(c.after)}</td></tr>`),
+    ...r.dropped.map(c => `<tr><td>${esc(c.label)}</td>
+      <td class="cell-before">有候选</td><td class="cell-arrow">→</td>
+      <td class="cell-after muted">无候选</td></tr>`),
+  ].join("");
+  $("#rematchBody").innerHTML = rows
+    ? `<table class="rematch-table"><thead><tr><th>条目 / 旧页</th><th>原候选</th><th></th><th>新候选</th></tr></thead>
+       <tbody>${rows}</tbody></table>`
+    : `<p class="muted">所有待确认定位号的头名候选都保持不变（锚点约束与当前结果一致）。</p>`;
+}
+
+async function executeRematch() {
+  try {
+    const r = await api(`/api/projects/${currentPid}/rematch`, { method: "POST" });
+    $("#rematchModal").classList.add("hidden");
+    await reloadState();
+    toast(`重匹配完成：${r.affected} 条候选变化，${r.pending_total} 条待确认已重算`, "success");
+  } catch (e) { toast(e.message, "error"); }
+}
+
 /* ---------------- 问题 ---------------- */
 
 function renderIssuesBadge() {
@@ -646,7 +922,7 @@ function renderIssues() {
     const eid = +it.dataset.entry, lid = +it.dataset.loc;
     if (!eid) return;
     $$(".tab").forEach(x => x.classList.toggle("active", x.dataset.tab === "inspect"));
-    ["inspect", "issues", "versions", "settings"].forEach(n =>
+    ["inspect", "anchors", "issues", "versions", "settings"].forEach(n =>
       $("#tab-" + n).classList.toggle("hidden", n !== "inspect"));
     selectLocator(eid, lid || null);
   }));
@@ -684,10 +960,21 @@ function renderVersions() {
 }
 
 function actionIcon(k) {
-  return { confirm: "✓", reject: "✗", rebind: "🔗", reset: "↺", batch_accept: "⚡", restore: "📌" }[k] || "•";
+  return { confirm: "✓", reject: "✗", rebind: "🔗", reset: "↺", batch_accept: "⚡",
+           restore: "📌", anchor_add: "⚓", anchor_toggle: "⚓",
+           anchor_delete: "⚓", anchor_note: "⚓" }[k] || "•";
 }
 
 function describeAction(d) {
+  if (d.kind && d.kind.startsWith("anchor_")) {
+    const pair = `旧${d.old_page}→新${d.new_page}`;
+    if (d.kind === "anchor_add")
+      return `${d.status === "disabled" ? "停用保存" : "新增"}锚点 ${pair}` + (d.note ? `（${d.note}）` : "");
+    if (d.kind === "anchor_toggle")
+      return `${d.to === "active" ? "启用" : "停用"}锚点 ${pair}`;
+    if (d.kind === "anchor_delete") return `删除锚点 ${pair}`;
+    if (d.kind === "anchor_note") return `修改锚点备注`;
+  }
   if (d.kind === "batch_accept" || d.label === undefined) {
     if (d.accepted) return `批量接受 ${d.accepted.length} 个高置信定位号`;
     if (d.snapshot) return `恢复版本「${d.snapshot}」`;

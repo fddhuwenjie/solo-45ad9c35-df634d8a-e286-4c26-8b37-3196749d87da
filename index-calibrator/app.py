@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Flask 入口：项目、导入、匹配、逐条/批量决定、撤销、快照、导出。"""
+"""Flask 入口：项目、导入、匹配、逐条/批量决定、撤销、快照、锚点、导出。"""
 import json
+import sqlite3
 
 from flask import Flask, Response, jsonify, render_template, request
 
+from core.anchors import (
+    anchor_conflicts, anchor_rows, build_ctx, export_anchors_json,
+    segments as anchor_segments, validate_anchor,
+)
 from core.db import get_db, init_db
 from core.exporter import export_csv, export_issues, export_proof_html
 from core.importer import parse_index_csv, parse_paged_text
@@ -273,6 +278,222 @@ def batch_accept(pid):
     return jsonify({"accepted": len(accepted), "skipped": skipped})
 
 
+# ---- 页对照锚点 ---------------------------------------------------------
+
+def _anchor_payload(conn, pid):
+    ctx = build_ctx(conn, pid)
+    return {
+        "anchors": anchor_rows(conn, pid),
+        "segments": anchor_segments(conn, pid, ctx) if ctx else [],
+        "page_map": {str(k): v for k, v in
+                     sorted((ctx["page_map"] if ctx else {}).items())},
+        "conflicts": anchor_conflicts(conn, pid, ctx),
+    }
+
+
+@app.route("/api/projects/<int:pid>/anchors", methods=["GET"])
+def list_anchors(pid):
+    conn = get_db()
+    if not conn.execute("SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone():
+        return jsonify({"error": "project not found"}), 404
+    return jsonify(_anchor_payload(conn, pid))
+
+
+@app.route("/api/projects/<int:pid>/anchors", methods=["POST"])
+def create_anchor(pid):
+    """{old_page, new_page, note?, active?} —— 校验单调分段映射后写入。"""
+    data = request.get_json(force=True) or {}
+    try:
+        old_page, new_page = int(data["old_page"]), int(data["new_page"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "请填写有效的旧版页与新版页（整数）"}), 400
+    note = (data.get("note") or "").strip()
+    status = "active" if data.get("active", True) else "disabled"
+    conn = get_db()
+    if not conn.execute("SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone():
+        return jsonify({"error": "project not found"}), 404
+
+    if status == "active":
+        problem = validate_anchor(conn, pid, old_page, new_page)
+        if problem:
+            return jsonify({"error": problem, "code": "anchor_conflict"}), 409
+
+    try:
+        cur = conn.execute(
+            "INSERT INTO page_anchors (project_id, old_page, new_page, status, note)"
+            " VALUES (?,?,?,?,?)",
+            (pid, old_page, new_page, status, note))
+    except sqlite3.IntegrityError:
+        return jsonify({"error": f"锚点 旧{old_page}→新{new_page} 已存在（重复占用）",
+                        "code": "anchor_conflict"}), 409
+    aid = cur.lastrowid
+    log_action(conn, pid, "anchor_add",
+               {"old_page": old_page, "new_page": new_page, "note": note,
+                "status": status, "anchor": aid},
+               "DELETE FROM page_anchors WHERE id=?", [aid])
+    conn.commit()
+    return jsonify({"ok": True, "id": aid, **_anchor_payload(conn, pid)})
+
+
+@app.route("/api/anchors/<int:aid>/toggle", methods=["POST"])
+def toggle_anchor(aid):
+    """启用 / 停用锚点；启用时重新校验单调性。"""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM page_anchors WHERE id=?", (aid,)).fetchone()
+    if not row:
+        return jsonify({"error": "锚点不存在"}), 404
+    pid = row["project_id"]
+    a = dict(row)
+    if a["status"] == "active":
+        new_status = "disabled"
+    else:
+        problem = validate_anchor(conn, pid, a["old_page"], a["new_page"], ignore_id=aid)
+        if problem:
+            return jsonify({"error": problem, "code": "anchor_conflict"}), 409
+        new_status = "active"
+    conn.execute("UPDATE page_anchors SET status=? WHERE id=?", (new_status, aid))
+    log_action(conn, pid, "anchor_toggle",
+               {"anchor": aid, "old_page": a["old_page"], "new_page": a["new_page"],
+                "from": a["status"], "to": new_status},
+               "UPDATE page_anchors SET status=? WHERE id=?", [a["status"], aid])
+    conn.commit()
+    return jsonify({"ok": True, "status": new_status, **_anchor_payload(conn, pid)})
+
+
+@app.route("/api/anchors/<int:aid>/note", methods=["POST"])
+def note_anchor(aid):
+    data = request.get_json(force=True) or {}
+    note = (data.get("note") or "").strip()
+    conn = get_db()
+    row = conn.execute("SELECT * FROM page_anchors WHERE id=?", (aid,)).fetchone()
+    if not row:
+        return jsonify({"error": "锚点不存在"}), 404
+    pid, old_note = row["project_id"], row["note"]
+    conn.execute("UPDATE page_anchors SET note=? WHERE id=?", (note, aid))
+    log_action(conn, pid, "anchor_note",
+               {"anchor": aid, "from": old_note, "to": note},
+               "UPDATE page_anchors SET note=? WHERE id=?", [old_note, aid])
+    conn.commit()
+    return jsonify({"ok": True, **_anchor_payload(conn, pid)})
+
+
+@app.route("/api/anchors/<int:aid>", methods=["DELETE"])
+def delete_anchor(aid):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM page_anchors WHERE id=?", (aid,)).fetchone()
+    if not row:
+        return jsonify({"error": "锚点不存在"}), 404
+    pid = dict(row)["project_id"]
+    conn.execute("DELETE FROM page_anchors WHERE id=?", (aid,))
+    log_action(conn, pid, "anchor_delete",
+               {"anchor": aid, "old_page": row["old_page"], "new_page": row["new_page"]},
+               "INSERT INTO page_anchors (id, project_id, old_page, new_page, status, note)"
+               " VALUES (?,?,?,?,?,?)",
+               [aid, pid, row["old_page"], row["new_page"], row["status"], row["note"]])
+    conn.commit()
+    return jsonify({"ok": True, **_anchor_payload(conn, pid)})
+
+
+# ---- 锚点重匹配（预览 + 执行） -------------------------------------------
+
+def _snapshot_to_memory(conn):
+    """把当前库备份到内存连接，供重匹配 dry-run 使用（不触碰正式数据）。"""
+    mem = sqlite3.connect(":memory:")
+    conn.backup(mem)
+    mem.row_factory = sqlite3.Row
+    mem.execute("PRAGMA foreign_keys = ON")
+    return mem
+
+
+def _rematch_changes(conn, pid):
+    """在内存副本上按锚点重算全部待确认定位号，返回新旧头名候选对照。"""
+    ch_new = detect_chapter_starts(conn, pid, "new")
+    threshold = conn.execute(
+        "SELECT batch_threshold FROM projects WHERE id=?", (pid,)).fetchone()[0]
+    before = {r["id"]: dict(r) for r in conn.execute(
+        """SELECT c.locator_id AS id, c.new_start, c.new_end, c.method, c.score
+             FROM candidates c JOIN locators l ON l.id=c.locator_id
+             JOIN entries e ON e.id=l.entry_id
+            WHERE e.project_id=? AND c.rank=1 AND l.status='pending'""", (pid,))}
+
+    mem = _snapshot_to_memory(conn)
+    try:
+        run_matching(mem, pid, chapter_starts_new=ch_new, threshold=threshold)
+        after = {r["id"]: dict(r) for r in mem.execute(
+            """SELECT c.locator_id AS id, c.new_start, c.new_end, c.method, c.score
+                 FROM candidates c JOIN locators l ON l.id=c.locator_id
+                 JOIN entries e ON e.id=l.entry_id
+                WHERE e.project_id=? AND c.rank=1 AND l.status='pending'""", (pid,))}
+    finally:
+        mem.close()
+
+    labels = {r["id"]: (r["term"], r["subterm"], r["old_start"], r["old_end"])
+              for r in conn.execute(
+        """SELECT l.id, e.term, e.subterm, l.old_start, l.old_end
+             FROM locators l JOIN entries e ON e.id=l.entry_id
+            WHERE e.project_id=? AND l.status='pending'""", (pid,))}
+
+    changes, added, dropped = [], [], []
+    for lid in sorted(set(before) | set(after)):
+        b, a = before.get(lid), after.get(lid)
+        term, sub, os_, oe = labels.get(lid, ("?", None, None, None))
+        label = term + (f" — {sub}" if sub else "")
+        if b and a and (b["new_start"], b["new_end"]) != (a["new_start"], a["new_end"]):
+            changes.append({
+                "locator_id": lid, "label": label,
+                "old_locator": [os_, oe or os_],
+                "before": [b["new_start"], b["new_end"]],
+                "after": [a["new_start"], a["new_end"]],
+                "before_method": b["method"], "after_method": a["method"],
+                "before_score": b["score"], "after_score": a["score"],
+            })
+        elif b and not a:
+            dropped.append({"locator_id": lid, "label": label})
+        elif a and not b:
+            added.append({"locator_id": lid, "label": label,
+                          "after": [a["new_start"], a["new_end"]]})
+    return {
+        "pending_total": len(labels),
+        "affected": len(changes) + len(added) + len(dropped),
+        "changes": changes, "added": added, "dropped": dropped,
+    }
+
+
+@app.route("/api/projects/<int:pid>/rematch/preview", methods=["POST"])
+def rematch_preview(pid):
+    conn = get_db()
+    if not conn.execute("SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone():
+        return jsonify({"error": "project not found"}), 404
+    ctx = build_ctx(conn, pid)
+    if ctx is None:
+        return jsonify({"error": "还没有启用的锚点，无法按锚点重匹配"}), 400
+    return jsonify({"ok": True, "anchor_count": len(ctx["anchors"]),
+                    **_rematch_changes(conn, pid)})
+
+
+@app.route("/api/projects/<int:pid>/rematch", methods=["POST"])
+def rematch_apply(pid):
+    """固定锚点页，重算所有尚未确认定位号的候选；已确认/拒绝不动。"""
+    conn = get_db()
+    if not conn.execute("SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone():
+        return jsonify({"error": "project not found"}), 404
+    ctx = build_ctx(conn, pid)
+    if ctx is None:
+        return jsonify({"error": "还没有启用的锚点，无法按锚点重匹配"}), 400
+    summary = _rematch_changes(conn, pid)
+    ch_new = detect_chapter_starts(conn, pid, "new")
+    threshold = conn.execute(
+        "SELECT batch_threshold FROM projects WHERE id=?", (pid,)).fetchone()[0]
+    info = run_matching(conn, pid, chapter_starts_new=ch_new, threshold=threshold,
+                        anchor_ctx=ctx)
+    conn.execute(
+        "INSERT INTO meta (project_id,key,value) VALUES (?,?,?) "
+        "ON CONFLICT(project_id,key) DO UPDATE SET value=excluded.value",
+        (pid, "last_match", json.dumps(info, ensure_ascii=False)))
+    validate(conn, pid)
+    return jsonify({"ok": True, "info": info, **summary})
+
+
 # ---- 撤销 / 快照 --------------------------------------------------------
 
 @app.route("/api/projects/<int:pid>/undo", methods=["POST"])
@@ -287,7 +508,7 @@ def undo(pid):
 
 
 def _take_snapshot(conn, pid):
-    """序列化条目/定位号/候选（撤销日志与问题是派生数据，不入库快照）。"""
+    """序列化条目/定位号/候选/页对照锚点（撤销日志与问题是派生数据，不入快照）。"""
     entries = [dict(r) for r in conn.execute(
         "SELECT * FROM entries WHERE project_id=? ORDER BY id", (pid,))]
     locs = [dict(r) for r in conn.execute(
@@ -296,7 +517,10 @@ def _take_snapshot(conn, pid):
     cands = [dict(r) for r in conn.execute(
         "SELECT c.* FROM candidates c JOIN locators l ON l.id=c.locator_id "
         "JOIN entries e ON e.id=l.entry_id WHERE e.project_id=? ORDER BY c.id", (pid,))]
-    return json.dumps({"entries": entries, "locators": locs, "candidates": cands},
+    anchors = [dict(r) for r in conn.execute(
+        "SELECT * FROM page_anchors WHERE project_id=? ORDER BY id", (pid,))]
+    return json.dumps({"entries": entries, "locators": locs, "candidates": cands,
+                       "anchors": anchors},
                       ensure_ascii=False)
 
 
@@ -350,7 +574,16 @@ def restore_snapshot(pid, sid):
          c["method"], c["score"], c["reasons"]]) for c in current["candidates"]]
 
     data = json.loads(snap["payload"])
+    current_anchors = current.get("anchors", [])
+    undo_statements += [("DELETE FROM page_anchors WHERE project_id=?", [pid])]
+    undo_statements += [(
+        "INSERT INTO page_anchors (id, project_id, old_page, new_page, status, note,"
+        " created_at) VALUES (?,?,?,?,?,?,?)",
+        [a["id"], pid, a["old_page"], a["new_page"], a["status"], a["note"],
+         a["created_at"]]) for a in current_anchors]
+
     conn.execute("DELETE FROM entries WHERE project_id=?", (pid,))
+    conn.execute("DELETE FROM page_anchors WHERE project_id=?", (pid,))
     for e in data["entries"]:
         conn.execute(
             "INSERT INTO entries (id, project_id, term, subterm, kind, ref_target,"
@@ -367,6 +600,11 @@ def restore_snapshot(pid, sid):
         " score, reasons) VALUES (?,?,?,?,?,?,?,?)",
         [(c["id"], c["locator_id"], c["rank"], c["new_start"], c["new_end"],
           c["method"], c["score"], c["reasons"]) for c in data["candidates"]])
+    conn.executemany(
+        "INSERT INTO page_anchors (id, project_id, old_page, new_page, status, note,"
+        " created_at) VALUES (?,?,?,?,?,?,?)",
+        [(a["id"], pid, a["old_page"], a["new_page"], a["status"], a["note"],
+          a["created_at"]) for a in data.get("anchors", [])])
     log_action(conn, pid, "restore", {"snapshot": snap["name"]}, undo_statements)
     conn.commit()
     validate(conn, pid)
@@ -416,6 +654,9 @@ def export(pid, kind):
         body, mime, fname = export_proof_html(conn, pid), "text/html; charset=utf-8", base + "_proof.html"
     elif kind == "issues":
         body, mime, fname = export_issues(conn, pid), "text/plain; charset=utf-8", base + "_issues.txt"
+    elif kind == "anchors":
+        body, mime, fname = export_anchors_json(conn, pid), "application/json; charset=utf-8", \
+            base + "_anchors.json"
     else:
         return jsonify({"error": "unknown export"}), 400
     resp = Response(body, mimetype=mime)

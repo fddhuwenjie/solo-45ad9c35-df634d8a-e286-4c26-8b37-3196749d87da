@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS candidates (
     UNIQUE (locator_id, rank)
 );
 
+CREATE TABLE IF NOT EXISTS page_anchors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    old_page INTEGER NOT NULL,
+    new_page INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',         -- active | disabled
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (project_id, old_page, new_page)
+);
+
 CREATE TABLE IF NOT EXISTS issues (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

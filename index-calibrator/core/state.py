@@ -2,6 +2,7 @@
 """把数据库状态组装成前端需要的 JSON。"""
 import json
 
+from .anchors import anchor_conflicts, anchor_rows, build_ctx, segments
 from .validator import detect_chapter_starts
 
 
@@ -49,6 +50,9 @@ def build_state(conn, project_id):
                 "method": l["method"], "score": l["score"],
                 "confidence": blob.get("confidence"),
                 "reasons": blob.get("reasons", []),
+                "anchor_notes": blob.get("anchor_notes", []),
+                "segment_index": blob.get("segment_index"),
+                "anchor_pinned": blob.get("anchor_pinned", False),
             }
             stats[blob.get("confidence", "low")] += 1
         else:
@@ -77,6 +81,15 @@ def build_state(conn, project_id):
         "SELECT id, name, ts FROM snapshots WHERE project_id=? ORDER BY id DESC",
         (project_id,)).fetchall()
 
+    actx = build_ctx(conn, project_id)
+    anchors_payload = {
+        "anchors": anchor_rows(conn, project_id),
+        "segments": segments(conn, project_id, actx) if actx else [],
+        "page_map": {str(k): v for k, v in
+                     sorted((actx["page_map"] if actx else {}).items())},
+        "conflicts": anchor_conflicts(conn, project_id, actx),
+    }
+
     return {
         "project": {
             "id": proj["id"], "name": proj["name"],
@@ -100,6 +113,7 @@ def build_state(conn, project_id):
         "history": [{"id": h["id"], "ts": h["ts"], "kind": h["kind"],
                      "detail": json.loads(h["detail"])} for h in history],
         "snapshots": [{"id": s["id"], "name": s["name"], "ts": s["ts"]} for s in snapshots],
+        "anchors": anchors_payload,
         "match_info": get_meta(conn, project_id),
         "stats": stats,
     }
@@ -124,6 +138,9 @@ def all_candidates(conn, locator_id):
             "method": r["method"], "score": r["score"],
             "confidence": blob.get("confidence"),
             "reasons": blob.get("reasons", []),
+            "anchor_notes": blob.get("anchor_notes", []),
+            "segment_index": blob.get("segment_index"),
+            "anchor_pinned": blob.get("anchor_pinned", False),
             "highlights": blob.get("highlights", {}),
         })
     return out

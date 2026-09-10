@@ -24,6 +24,7 @@
         <a data-exp="csv">更新后的索引 CSV</a>
         <a data-exp="proof">可打印校样 (HTML)</a>
         <a data-exp="issues">未决问题报告</a>
+        <a data-exp="anchors">锚点对照表 (JSON)</a>
       </div>
     </span>
   </div>
@@ -86,6 +87,7 @@
             <button class="pgnav" data-side="old" data-dir="-1">‹</button>
             <span class="pgno" id="oldPgno">–</span>
             <button class="pgnav" data-side="old" data-dir="1">›</button>
+            <span class="anchor-badge" id="oldAnchorBadge"></span>
             <span class="rangelinks" id="oldRangelinks"></span>
           </div>
           <div class="page-body" id="oldPage"><div class="placeholder">选择左侧任一条目以查看旧版页面</div></div>
@@ -96,15 +98,23 @@
             <button class="pgnav" data-side="new" data-dir="-1">‹</button>
             <span class="pgno" id="newPgno">–</span>
             <button class="pgnav" data-side="new" data-dir="1">›</button>
+            <span class="anchor-badge" id="newAnchorBadge"></span>
             <span class="rangelinks" id="newRangelinks"></span>
           </div>
           <div class="page-body" id="newPage"><div class="placeholder">候选命中将在此高亮</div></div>
         </div>
       </div>
+      <div class="anchor-quickbar">
+        <button id="setAnchorBtn" class="anchor-btn">⚓ 把当前两页设为对照锚点</button>
+        <span class="small muted">旧 <b id="qbOld">–</b> ↔ 新 <b id="qbNew">–</b></span>
+        <input id="anchorQuickNote" placeholder="备注（可空，如：第二版前言插入处）">
+      </div>
       <div class="legend">
         <span><mark class="term">条目词</mark></span>
         <span><mark class="hit">邻近语句 / 指纹命中</mark></span>
-        <span class="lg-text">点击左侧条目定位；点击右侧候选可切换高亮页。</span>
+        <span><i class="seg-dot seg-0"></i>锚点区间着色</span>
+        <span>⚓ 锚点页</span>
+        <span class="lg-text">页侧徽章显示锚点；色条标出该页所属的映射区间。</span>
       </div>
     </section>
 
@@ -112,6 +122,7 @@
     <aside class="panel inspector">
       <div class="tabs">
         <button class="tab active" data-tab="inspect">候选</button>
+        <button class="tab" data-tab="anchors">锚点 <em id="anchorCount" class="anchor-em">0</em></button>
         <button class="tab" data-tab="issues">问题 <em id="issueCount">0</em></button>
         <button class="tab" data-tab="versions">版本</button>
         <button class="tab" data-tab="settings">规则</button>
@@ -119,6 +130,9 @@
 
       <div class="tab-body" id="tab-inspect">
         <div id="inspectContent"><p class="muted">在左侧选择一个页码定位号。</p></div>
+      </div>
+      <div class="tab-body hidden" id="tab-anchors">
+        <div id="anchorsContent"></div>
       </div>
       <div class="tab-body hidden" id="tab-issues">
         <div id="issuesContent"></div>
@@ -183,6 +197,21 @@
     <div class="modal-foot">
       <button data-close="importModal">取消</button>
       <button id="impDo" class="primary">导入</button>
+    </div>
+  </div>
+</div>
+
+<!-- 锚点重匹配确认弹窗 -->
+<div class="modal-mask hidden" id="rematchModal">
+  <div class="modal wide">
+    <h2>按页对照锚点重匹配</h2>
+    <p class="muted small" id="rematchSummary"></p>
+    <div id="rematchBody" class="rematch-body"></div>
+    <p class="small muted">已确认 / 已拒绝的定位号不会改动；锚点固定页保持不变。
+       重匹配本身不入撤销栈，执行前可先到「版本」标签保存命名版本。</p>
+    <div class="modal-foot">
+      <button data-close="rematchModal">取消</button>
+      <button id="rematchDo" class="primary">执行重匹配</button>
     </div>
   </div>
 </div>

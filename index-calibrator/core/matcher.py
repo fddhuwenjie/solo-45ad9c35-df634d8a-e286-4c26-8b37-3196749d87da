@@ -15,6 +15,7 @@
 import json
 from collections import Counter
 
+from .anchors import build_ctx, locator_bounds
 from .utils import (
     content_terms, jaccard, containment, normalize, shingles,
     short_title, split_sentences,
@@ -160,7 +161,14 @@ def _crosses_chapter(new_start, new_end, chapter_starts):
 # ---- 主入口 -------------------------------------------------------------
 
 def run_matching(conn, project_id, only_locator_ids=None, chapter_starts_new=None,
-                 threshold=0.85):
+                 threshold=0.85, anchor_ctx=None):
+    """重算候选页。
+
+    anchor_ctx 为 :func:`core.anchors.build_ctx` 的结果；传入 False 可显式
+    关闭锚点约束，None 时按数据库当前启用锚点自动构建。
+    """
+    if anchor_ctx is None:
+        anchor_ctx = build_ctx(conn, project_id)
     proj = conn.execute("SELECT heading_regex FROM projects WHERE id=?", (project_id,)).fetchone()
     old_rows = conn.execute(
         "SELECT * FROM pages WHERE project_id=? AND edition='old' ORDER BY page_no",
@@ -192,6 +200,22 @@ def run_matching(conn, project_id, only_locator_ids=None, chapter_starts_new=Non
         window_nos = [n for n in range(s, e + 1) if n in old]
         if not window_nos:
             continue
+
+        # ---- 页对照锚点约束：固定锚点页，候选块只能落在相邻锚点区间内 ----
+        abounds = locator_bounds(anchor_ctx, s, e) if anchor_ctx else None
+
+        def feasible(cs, ce):
+            """候选块 [cs, ce] 是否满足锚点区间约束。"""
+            if abounds is None:
+                return True
+            if cs < abounds["seg_lo"] or ce > abounds["seg_hi"]:
+                return False
+            # 范围横跨锚点页时，块必须覆盖这些锚点所固定的新页（允许 1 页排版余量）
+            for _po, pn in abounds["pins"]:
+                if not (cs - 1 <= pn <= ce + 1):
+                    return False
+            return True
+
         terms = content_terms((loc["subterm"] or "") + " " + loc["term"]) \
             if loc["subterm"] else content_terms(loc["term"])
         anchors = _pick_anchors(old, window_nos, terms)
@@ -269,7 +293,7 @@ def run_matching(conn, project_id, only_locator_ids=None, chapter_starts_new=Non
                 best_by_len[cand_len] = (best_start, best_m, best_q)
         base_recall = best_by_len[length][1]["recall"] if length in best_by_len else None
 
-        # --- 三种候选方法 ---
+        # --- 三种候选方法 + 锚点固定候选 ---
         raw_cands = []
 
         mapped_targets = sorted({mapping.get(n) for n in window_nos} - {None})
@@ -301,10 +325,41 @@ def run_matching(conn, project_id, only_locator_ids=None, chapter_starts_new=Non
                 qq = quality(best_m, base_recall)
             raw_cands.append((best_start, best_start + cand_len - 1, "window", qq))
 
-        # 去重并计算范围分（合并方法标签）
+        # 锚点固定候选：范围内锚点页把候选块固定在对应新页；
+        # 单页定位号正落在锚点页时，该候选必须置顶（人工锚点优先于自动信号）。
+        anchor_forced = None
+        if abounds is not None:
+            if s == e and abounds["pins"] and abounds["pins"][0][0] == s:
+                ps, pe = abounds["pins"][0][1], abounds["pins"][0][1]
+                anchor_forced = (ps, pe)
+            elif abounds["projected"] is not None:
+                ps, pe = abounds["projected"]
+                # 投影退化（首锚前/末锚后外推等）时退回各 pin 包围范围
+                pin_news = [pn for _po, pn in abounds["pins"]]
+                if pin_news:
+                    ps, pe = min(ps, *pin_news), max(pe, *pin_news)
+            else:
+                pin_news = [pn for _po, pn in abounds["pins"]]
+                ps, pe = (min(pin_news), max(pin_news)) if pin_news else (None, None)
+            if ps is not None and ps in new and pe in new:
+                am = block_metrics(ps, pe - ps + 1)
+                if am is not None:
+                    raw_cands.append((ps, pe, "anchor", quality(am, base_recall)))
+
+        # 去重并计算范围分（合并方法标签）；锚点区间外的块一律剔除
         seen_methods = {}
         for cs, ce, method, _q in raw_cands:
+            if not feasible(cs, ce):
+                continue
             seen_methods.setdefault((cs, ce), []).append(method)
+
+        # 兜底：锚点区间内没有任何成立块时（极窄区间 + 拆分扩张都被拒绝），
+        # 放回区间内的最优块并在原因里提示，避免出现“无候选”。
+        anchor_fallback = False
+        if abounds is not None and not seen_methods:
+            anchor_fallback = True
+            for cs, ce, method, _q in raw_cands:
+                seen_methods.setdefault((cs, ce), []).append(method)
 
         merged = []
         for (cs, ce), methods in seen_methods.items():
@@ -318,11 +373,27 @@ def run_matching(conn, project_id, only_locator_ids=None, chapter_starts_new=Non
                            "score": round(rscore, 4), "coverage": round(m["recall"], 3)})
 
         merged.sort(key=lambda c: c["score"], reverse=True)
+        # 人工锚点固定的单页候选无条件置顶
+        if anchor_forced is not None:
+            merged.sort(key=lambda c: 0 if (c["start"], c["end"]) == anchor_forced else 1)
         cands = merged[:4]
 
         # --- 头名候选的歧义原因 ---
         top = cands[0]
         reasons = []
+        anchor_notes = []
+        if abounds is not None:
+            if anchor_forced is not None:
+                anchor_notes.append(["anchor_pinned",
+                                     f"已固定到人工锚点 旧{s}→新{anchor_forced[0]}"])
+            elif anchor_fallback:
+                anchor_notes.append(["anchor_relaxed",
+                                     "锚点区间内无合格自动候选，已放宽区间约束取最优块，请人工核对"])
+            else:
+                anchor_notes.append(["anchor_segment",
+                                     f"候选已约束在锚点区间 新{abounds['seg_lo']}–{abounds['seg_hi']}"
+                                     + (f"，并覆盖固定页 {','.join(str(p) for _, p in abounds['pins'])}"
+                                        if abounds["pins"] else "")])
         second_score = cands[1]["score"] if len(cands) > 1 else 0.0
         old_len, new_len = length, top["end"] - top["start"] + 1
         mapped_span = (max(mapped_targets) - min(mapped_targets) + 1) if mapped_targets else old_len
@@ -375,13 +446,20 @@ def run_matching(conn, project_id, only_locator_ids=None, chapter_starts_new=Non
         conn.execute("DELETE FROM candidates WHERE locator_id=?", (loc["id"],))
         for rank, c in enumerate(cands, 1):
             reason_blob = reasons if rank == 1 else []
+            extra = {}
+            if rank == 1 and abounds is not None:
+                extra = {"anchor_notes": anchor_notes,
+                         "segment_index": abounds["segment_index"],
+                         "anchor_pinned": anchor_forced is not None
+                                          and (c["start"], c["end"]) == anchor_forced}
             conn.execute(
                 "INSERT INTO candidates (locator_id, rank, new_start, new_end, method, score, reasons)"
                 " VALUES (?,?,?,?,?,?,?)",
                 (loc["id"], rank, c["start"], c["end"], c["method"], c["score"],
                  json.dumps({"reasons": reason_blob, "confidence": conf,
-                             "highlights": highlights}, ensure_ascii=False)),
+                             "highlights": highlights, **extra}, ensure_ascii=False)),
             )
     conn.commit()
     return {"global_offset": global_offset, "offset_ratio": round(offset_ratio, 3),
-            "mapping": {str(k): v for k, v in mapping.items()}}
+            "mapping": {str(k): v for k, v in mapping.items()},
+            "anchors": len(anchor_ctx["anchors"]) if anchor_ctx else 0}

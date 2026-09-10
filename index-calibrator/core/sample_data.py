@@ -246,5 +246,12 @@ def load_sample(conn, name="样例：养蜂手册换版（旧 10 页 / 新 12 �
             conn.execute(
                 "INSERT INTO locators (entry_id, old_start, old_end) VALUES (?,?,?)",
                 (entry_id, s, e))
+
+    # 预置一个停用的页对照锚点（编辑暂定、尚未启用）：
+    # 旧 5→新 6。启用它可演示单调分段映射与按锚点重匹配；当前停用不影响匹配。
+    conn.execute(
+        "INSERT INTO page_anchors (project_id, old_page, new_page, status, note)"
+        " VALUES (?,?,?,?,?)",
+        (pid, 5, 6, "disabled", "暂定对照点：Piping 一段在新版可能仍从第 6 页起，需并排核对"))
     conn.commit()
     return pid
